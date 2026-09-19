@@ -1,0 +1,25 @@
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+google-genai
+
+# Environment variables
+.env
+.env.*
+
+backend/.env
+backend/*.env
+
+
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3

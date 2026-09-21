@@ -146,6 +146,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://10.184.177.103:5173",
         "https://ink-sense-frontend.vercel.app",
     ],
 
@@ -774,6 +775,7 @@ async def live_signaling(websocket: WebSocket, session_id: str):
     cleanup_live_sessions()
 
     session = LIVE_SESSIONS.get(session_id)
+
     if not session:
         await websocket.close(code=4404)
         return
@@ -782,18 +784,24 @@ async def live_signaling(websocket: WebSocket, session_id: str):
     join_code = websocket.query_params.get("code", "")
     token = websocket.query_params.get("token", "")
 
+    # Only host and phone are allowed
     if role not in {"host", "phone"}:
         await websocket.close(code=4400)
         return
 
+    # ---------------------------------------------------------
+    # PHONE AUTHENTICATION
+    # ---------------------------------------------------------
     if role == "phone":
         if not secrets.compare_digest(join_code, session["join_code"]):
             await websocket.close(code=4403)
             return
+
     else:
         if not token:
             await websocket.close(code=4401)
             return
+
         try:
             authenticated_user_id = get_authenticated_user_id(
                 f"Bearer {token}"
@@ -801,47 +809,108 @@ async def live_signaling(websocket: WebSocket, session_id: str):
         except HTTPException:
             await websocket.close(code=4401)
             return
+
         if authenticated_user_id != session["user_id"]:
             await websocket.close(code=4403)
             return
 
+    # Both phone and host connections must be accepted
     if len(session["connections"]) >= 2:
         await websocket.close(code=4409)
         return
 
+    await websocket.accept()
     session["connections"].add(websocket)
 
-    try:
-        # Tell both sides when the second participant has joined.
-        if len(session["connections"]) == 2:
-            for peer in list(session["connections"]):
-                await peer.send_json({"type": "peer_joined"})
+    print(
+        f"LIVE SIGNALING CONNECTED: role={role}, "
+        f"session={session_id}, "
+        f"connections={len(session['connections'])}"
+    )
 
+    try:
+
+        # -----------------------------------------------------
+        # Notify both sides when host + phone are connected
+        # -----------------------------------------------------
+        if len(session["connections"]) == 2:
+
+            print(
+                f"LIVE SESSION READY: {session_id}"
+            )
+
+            for peer in list(session["connections"]):
+
+                try:
+                    await peer.send_json({
+                        "type": "peer_joined"
+                    })
+
+                except Exception as error:
+                    print(
+                        "PEER JOIN NOTIFICATION ERROR:",
+                        error
+                    )
+
+        # -----------------------------------------------------
+        # WebSocket signaling loop
+        # -----------------------------------------------------
         while True:
+
             message = await websocket.receive_json()
+
             message_type = message.get("type")
 
-            if message_type not in {"offer", "answer", "ice"}:
+            if message_type not in {
+                "offer",
+                "answer",
+                "ice"
+            }:
                 continue
 
+            # Forward signaling message to the other peer
             for peer in list(session["connections"]):
+
                 if peer is websocket:
                     continue
+
                 try:
                     await peer.send_json(message)
-                except Exception:
-                    pass
+
+                except Exception as error:
+                    print(
+                        "SIGNALING SEND ERROR:",
+                        error
+                    )
 
     except Exception as error:
-        print("LIVE SIGNALING CLOSED:", str(error))
+
+        print(
+            "LIVE SIGNALING CLOSED:",
+            str(error)
+        )
+
     finally:
+
         session["connections"].discard(websocket)
+
+        print(
+            f"LIVE {role.upper()} DISCONNECTED: "
+            f"{session_id}"
+        )
+
+        # Tell remaining peer that the other side left
         for peer in list(session["connections"]):
+
             try:
-                await peer.send_json({"type": "peer_left"})
+                await peer.send_json({
+                    "type": "peer_left"
+                })
+
             except Exception:
                 pass
 
+            
 @app.post("/api/digitize")
 async def digitize(
 

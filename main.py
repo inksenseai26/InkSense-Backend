@@ -5,6 +5,8 @@ from fastapi import (
     Form,
     HTTPException,
     Header,
+    WebSocket,
+    WebSocketDisconnect,
 )
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +24,8 @@ from gemini_service import (
 
 import os
 import hashlib
+import secrets
+import time
 
 
 # =========================================================
@@ -94,6 +98,153 @@ app = FastAPI(
 
 
 # =========================================================
+# WEBRTC CAMERA SIGNALING
+# =========================================================
+
+camera_rooms = {}
+# Maps authenticated Supabase user IDs to their active camera session.
+# This lets the phone and laptop for the same user join the same room.
+camera_user_sessions = {}
+camera_sessions = {}
+
+
+async def broadcast_camera_message(
+    room_id,
+    sender,
+    message,
+):
+    """Send a WebRTC signaling message to the other
+    device in the same camera room.
+    """
+
+    connections = camera_rooms.get(
+        room_id,
+        []
+    )
+
+    for connection in list(connections):
+
+        if connection is sender:
+            continue
+
+        try:
+            await connection.send_json(
+                message
+            )
+
+        except Exception:
+            try:
+                connections.remove(
+                    connection
+                )
+            except ValueError:
+                pass
+
+
+@app.websocket(
+    "/ws/camera/{session_id}"
+)
+async def camera_signaling(
+    websocket: WebSocket,
+    session_id: str,
+):
+
+    # -----------------------------------------------------
+    # Validate the private camera session before accepting
+    # the WebSocket connection.
+    # -----------------------------------------------------
+
+    camera_session = camera_sessions.get(
+        session_id
+    )
+
+    if camera_session is None:
+
+        await websocket.close(
+            code=1008,
+            reason="Invalid camera session."
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # Expire old camera sessions
+    # -----------------------------------------------------
+
+    if time.time() > camera_session["expires_at"]:
+
+        camera_sessions.pop(
+            session_id,
+            None
+        )
+
+        if camera_session.get("user_id"):
+            if camera_user_sessions.get(
+                camera_session["user_id"]
+            ) == session_id:
+                camera_user_sessions.pop(
+                    camera_session["user_id"],
+                    None
+                )
+
+        await websocket.close(
+            code=1008,
+            reason="Camera session expired."
+        )
+
+        return
+
+    await websocket.accept()
+
+    camera_rooms.setdefault(
+        session_id,
+        []
+    ).append(websocket)
+
+    print(
+        f"📹 Camera device connected "
+        f"to session: {session_id}"
+    )
+
+    try:
+
+        while True:
+
+            message = await websocket.receive_json()
+
+            await broadcast_camera_message(
+                session_id,
+                websocket,
+                message,
+            )
+
+    except WebSocketDisconnect:
+
+        print(
+            f"📴 Camera device disconnected "
+            f"from session: {session_id}"
+        )
+
+    finally:
+
+        connections = camera_rooms.get(
+            session_id,
+            []
+        )
+
+        if websocket in connections:
+            connections.remove(
+                websocket
+            )
+
+        if not connections:
+            camera_rooms.pop(
+                session_id,
+                None
+            )
+
+            
+# =========================================================
 # CORS
 # =========================================================
 
@@ -101,10 +252,11 @@ app.add_middleware(
     CORSMiddleware,
 
     allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "https://ink-sense-frontend.vercel.app",
-    ],
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://10.184.177.103:5173",
+    "https://ink-sense-frontend.vercel.app",
+],
 
     allow_credentials=True,
 
@@ -284,6 +436,105 @@ def get_authenticated_user_id(
         )
 
     return str(user_id)
+
+
+# =========================================================
+# CAMERA SESSION
+# =========================================================
+
+@app.post("/api/camera/session")
+async def create_camera_session(
+    authorization: Optional[str] = Header(
+        default=None
+    )
+):
+    """
+    Return the active short-lived private camera session for
+    the currently authenticated InkSense user.
+
+    The first device (normally the phone) creates the session.
+    The second device (normally the laptop receiver) receives
+    the same session ID, so both devices join the same WebRTC
+    signaling room.
+
+    A random session ID is used as the pairing secret; the
+    Supabase access token is never placed in the WebSocket URL.
+    """
+
+    authenticated_user_id = (
+        get_authenticated_user_id(
+            authorization
+        )
+    )
+
+    now = time.time()
+
+    # ---------------------------------------------------------
+    # Reuse an existing unexpired session for this user.
+    # This allows the phone and laptop to get the SAME room ID.
+    # ---------------------------------------------------------
+
+    existing_session_id = camera_user_sessions.get(
+        authenticated_user_id
+    )
+
+    if existing_session_id:
+        existing_session = camera_sessions.get(
+            existing_session_id
+        )
+
+        if (
+            existing_session is not None
+            and now <= existing_session.get(
+                "expires_at",
+                0
+            )
+        ):
+            return {
+                "success": True,
+                "session_id": existing_session_id,
+                "expires_in": max(
+                    0,
+                    int(
+                        existing_session["expires_at"]
+                        - now
+                    )
+                ),
+            }
+
+        # Remove stale mapping/session before creating a new one.
+        camera_user_sessions.pop(
+            authenticated_user_id,
+            None
+        )
+
+        camera_sessions.pop(
+            existing_session_id,
+            None
+        )
+
+    # ---------------------------------------------------------
+    # Create a new private session.
+    # ---------------------------------------------------------
+
+    session_id = secrets.token_urlsafe(32)
+    expires_at = now + 600
+
+    camera_sessions[session_id] = {
+        "user_id": authenticated_user_id,
+        "created_at": now,
+        "expires_at": expires_at,
+    }
+
+    camera_user_sessions[
+        authenticated_user_id
+    ] = session_id
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "expires_in": 600,
+    }
 
 
 # =========================================================

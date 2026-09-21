@@ -146,7 +146,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "https://inksense-ai.vercel.app",
+        "https://ink-sense-frontend.vercel.app",
     ],
 
     allow_credentials=True,
@@ -733,7 +733,7 @@ async def create_live_session(
 
     frontend_url = os.getenv(
         "FRONTEND_URL",
-        "https://inksense-ai.vercel.app"
+        "https://ink-sense-frontend.vercel.app"
     ).rstrip("/")
 
     return {

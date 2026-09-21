@@ -5,6 +5,7 @@ from fastapi import (
     Form,
     HTTPException,
     Header,
+    WebSocket,
 )
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +23,48 @@ from gemini_service import (
 
 import os
 import hashlib
+import asyncio
+import secrets
+
+
+# =========================================================
+# LIVE CAMERA WEBRTC SESSION STATE
+# =========================================================
+
+# This is intentionally in-memory for the first prototype.
+# It works reliably with a single FastAPI/Render instance.
+# A shared store (for example Redis) can be added later if
+# the backend is scaled to multiple instances.
+LIVE_SESSION_TTL_SECONDS = 15 * 60
+LIVE_SESSIONS = {}
+LIVE_USER_SESSIONS = {}
+
+
+def cleanup_live_sessions():
+    now = datetime.now(timezone.utc).timestamp()
+    expired = [
+        session_id
+        for session_id, session in LIVE_SESSIONS.items()
+        if now - session["created_at"] > LIVE_SESSION_TTL_SECONDS
+    ]
+
+    for session_id in expired:
+        session = LIVE_SESSIONS.pop(session_id, None)
+        if session:
+            LIVE_USER_SESSIONS.pop(session["user_id"], None)
+
+
+def create_live_code():
+    cleanup_live_sessions()
+
+    while True:
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        if not any(
+            session["join_code"] == code
+            for session in LIVE_SESSIONS.values()
+        ):
+            return code
+
 
 
 # =========================================================
@@ -103,7 +146,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "https://ink-sense-frontend.vercel.app",
+        "https://inksense-ai.vercel.app",
     ],
 
     allow_credentials=True,
@@ -659,6 +702,145 @@ def gemini_test():
 # =========================================================
 # DIGITISE HANDWRITING
 # =========================================================
+
+# =========================================================
+# LIVE CAMERA SESSION / WEBRTC SIGNALING
+# =========================================================
+
+@app.post("/api/live/session")
+async def create_live_session(
+    authorization: Optional[str] = Header(default=None)
+):
+    authenticated_user_id = get_authenticated_user_id(authorization)
+
+    cleanup_live_sessions()
+
+    # Only one active phone-camera session is allowed per login.
+    old_session_id = LIVE_USER_SESSIONS.get(authenticated_user_id)
+    if old_session_id:
+        LIVE_SESSIONS.pop(old_session_id, None)
+
+    session_id = str(uuid4())
+    join_code = create_live_code()
+
+    LIVE_SESSIONS[session_id] = {
+        "user_id": authenticated_user_id,
+        "join_code": join_code,
+        "created_at": datetime.now(timezone.utc).timestamp(),
+        "connections": set(),
+    }
+    LIVE_USER_SESSIONS[authenticated_user_id] = session_id
+
+    frontend_url = os.getenv(
+        "FRONTEND_URL",
+        "https://inksense-ai.vercel.app"
+    ).rstrip("/")
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "join_code": join_code,
+        "phone_url": f"{frontend_url}/live-camera-phone/{session_id}?code={join_code}",
+        "expires_in": LIVE_SESSION_TTL_SECONDS,
+    }
+
+
+@app.delete("/api/live/session/{session_id}")
+async def delete_live_session(
+    session_id: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    authenticated_user_id = get_authenticated_user_id(authorization)
+    session = LIVE_SESSIONS.get(session_id)
+
+    if not session or session["user_id"] != authenticated_user_id:
+        raise HTTPException(status_code=404, detail="Live session not found.")
+
+    for websocket in list(session["connections"]):
+        try:
+            await websocket.close(code=1000)
+        except Exception:
+            pass
+
+    LIVE_SESSIONS.pop(session_id, None)
+    if LIVE_USER_SESSIONS.get(authenticated_user_id) == session_id:
+        LIVE_USER_SESSIONS.pop(authenticated_user_id, None)
+
+    return {"success": True}
+
+
+@app.websocket("/ws/live/{session_id}")
+async def live_signaling(websocket: WebSocket, session_id: str):
+    cleanup_live_sessions()
+
+    session = LIVE_SESSIONS.get(session_id)
+    if not session:
+        await websocket.close(code=4404)
+        return
+
+    role = websocket.query_params.get("role")
+    join_code = websocket.query_params.get("code", "")
+    token = websocket.query_params.get("token", "")
+
+    if role not in {"host", "phone"}:
+        await websocket.close(code=4400)
+        return
+
+    if role == "phone":
+        if not secrets.compare_digest(join_code, session["join_code"]):
+            await websocket.close(code=4403)
+            return
+    else:
+        if not token:
+            await websocket.close(code=4401)
+            return
+        try:
+            authenticated_user_id = get_authenticated_user_id(
+                f"Bearer {token}"
+            )
+        except HTTPException:
+            await websocket.close(code=4401)
+            return
+        if authenticated_user_id != session["user_id"]:
+            await websocket.close(code=4403)
+            return
+
+    if len(session["connections"]) >= 2:
+        await websocket.close(code=4409)
+        return
+
+    session["connections"].add(websocket)
+
+    try:
+        # Tell both sides when the second participant has joined.
+        if len(session["connections"]) == 2:
+            for peer in list(session["connections"]):
+                await peer.send_json({"type": "peer_joined"})
+
+        while True:
+            message = await websocket.receive_json()
+            message_type = message.get("type")
+
+            if message_type not in {"offer", "answer", "ice"}:
+                continue
+
+            for peer in list(session["connections"]):
+                if peer is websocket:
+                    continue
+                try:
+                    await peer.send_json(message)
+                except Exception:
+                    pass
+
+    except Exception as error:
+        print("LIVE SIGNALING CLOSED:", str(error))
+    finally:
+        session["connections"].discard(websocket)
+        for peer in list(session["connections"]):
+            try:
+                await peer.send_json({"type": "peer_left"})
+            except Exception:
+                pass
 
 @app.post("/api/digitize")
 async def digitize(

@@ -4,3 +4,4 @@ python-multipart
 python-dotenv
 google-genai
 supabase
+aiortc==1.15.0

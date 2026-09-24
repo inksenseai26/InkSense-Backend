@@ -1,11 +1,12 @@
 from fastapi import (
     FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    HTTPException,
+    Header,
     UploadFile,
     File,
     Form,
-    HTTPException,
-    Header,
-    WebSocket,
 )
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +37,7 @@ import secrets
 # A shared store (for example Redis) can be added later if
 # the backend is scaled to multiple instances.
 LIVE_SESSION_TTL_SECONDS = 15 * 60
+
 LIVE_SESSIONS = {}
 LIVE_USER_SESSIONS = {}
 
@@ -728,8 +730,12 @@ async def create_live_session(
         "user_id": authenticated_user_id,
         "join_code": join_code,
         "created_at": datetime.now(timezone.utc).timestamp(),
-        "connections": set(),
+
+        # Track each role separately.
+        "host": None,
+        "phone": None,
     }
+
     LIVE_USER_SESSIONS[authenticated_user_id] = session_id
 
     frontend_url = os.getenv(
@@ -752,26 +758,40 @@ async def delete_live_session(
     authorization: Optional[str] = Header(default=None)
 ):
     authenticated_user_id = get_authenticated_user_id(authorization)
+
     session = LIVE_SESSIONS.get(session_id)
 
     if not session or session["user_id"] != authenticated_user_id:
-        raise HTTPException(status_code=404, detail="Live session not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Live session not found."
+        )
 
-    for websocket in list(session["connections"]):
-        try:
-            await websocket.close(code=1000)
-        except Exception:
-            pass
+    # Close both possible connections
+    for websocket in [
+        session.get("host"),
+        session.get("phone"),
+    ]:
+        if websocket is not None:
+            try:
+                await websocket.close(code=1000)
+            except Exception:
+                pass
 
     LIVE_SESSIONS.pop(session_id, None)
+
     if LIVE_USER_SESSIONS.get(authenticated_user_id) == session_id:
         LIVE_USER_SESSIONS.pop(authenticated_user_id, None)
 
     return {"success": True}
 
 
+
 @app.websocket("/ws/live/{session_id}")
-async def live_signaling(websocket: WebSocket, session_id: str):
+async def live_signaling(
+    websocket: WebSocket,
+    session_id: str
+):
     cleanup_live_sessions()
 
     session = LIVE_SESSIONS.get(session_id)
@@ -784,7 +804,10 @@ async def live_signaling(websocket: WebSocket, session_id: str):
     join_code = websocket.query_params.get("code", "")
     token = websocket.query_params.get("token", "")
 
-    # Only host and phone are allowed
+    # ---------------------------------------------------------
+    # VALIDATE ROLE
+    # ---------------------------------------------------------
+
     if role not in {"host", "phone"}:
         await websocket.close(code=4400)
         return
@@ -792,117 +815,220 @@ async def live_signaling(websocket: WebSocket, session_id: str):
     # ---------------------------------------------------------
     # PHONE AUTHENTICATION
     # ---------------------------------------------------------
+
     if role == "phone":
-        if not secrets.compare_digest(join_code, session["join_code"]):
+
+        if not secrets.compare_digest(
+            join_code,
+            session["join_code"]
+        ):
             await websocket.close(code=4403)
             return
 
-    else:
+    # ---------------------------------------------------------
+    # HOST AUTHENTICATION
+    # ---------------------------------------------------------
+
+    if role == "host":
+
         if not token:
             await websocket.close(code=4401)
             return
 
         try:
-            authenticated_user_id = get_authenticated_user_id(
-                f"Bearer {token}"
+
+            authenticated_user_id = (
+                get_authenticated_user_id(
+                    f"Bearer {token}"
+                )
             )
+
         except HTTPException:
+
             await websocket.close(code=4401)
             return
 
         if authenticated_user_id != session["user_id"]:
+
             await websocket.close(code=4403)
             return
 
-    # Both phone and host connections must be accepted
-    if len(session["connections"]) >= 2:
-        await websocket.close(code=4409)
-        return
+    # ---------------------------------------------------------
+    # ACCEPT CONNECTION
+    # ---------------------------------------------------------
 
     await websocket.accept()
-    session["connections"].add(websocket)
 
     print(
-        f"LIVE SIGNALING CONNECTED: role={role}, "
-        f"session={session_id}, "
-        f"connections={len(session['connections'])}"
+        f"LIVE SIGNALING CONNECTED: "
+        f"role={role}, "
+        f"session={session_id}"
     )
 
-    try:
+    # ---------------------------------------------------------
+    # HANDLE EXISTING CONNECTION OF SAME ROLE
+    # ---------------------------------------------------------
 
-        # -----------------------------------------------------
-        # Notify both sides when host + phone are connected
-        # -----------------------------------------------------
-        if len(session["connections"]) == 2:
+    old_socket = session.get(role)
 
-            print(
-                f"LIVE SESSION READY: {session_id}"
-            )
+    if old_socket is not None and old_socket is not websocket:
 
-            for peer in list(session["connections"]):
+        print(
+            f"LIVE REPLACING OLD {role.upper()} CONNECTION"
+        )
+
+        try:
+            await old_socket.close(code=1000)
+        except Exception:
+            pass
+
+    # Store the new connection.
+    session[role] = websocket
+
+    # ---------------------------------------------------------
+    # CHECK WHETHER BOTH SIDES ARE CONNECTED
+    # ---------------------------------------------------------
+
+    host_connected = (
+        session.get("host") is not None
+    )
+
+    phone_connected = (
+        session.get("phone") is not None
+    )
+
+    if host_connected and phone_connected:
+
+        print(
+            f"LIVE SESSION READY: {session_id}"
+        )
+
+        for peer in [
+            session.get("host"),
+            session.get("phone")
+        ]:
+
+            if peer is not None:
 
                 try:
+
                     await peer.send_json({
                         "type": "peer_joined"
                     })
 
                 except Exception as error:
+
                     print(
-                        "PEER JOIN NOTIFICATION ERROR:",
-                        error
+                        "LIVE PEER JOIN NOTIFY ERROR:",
+                        str(error)
                     )
 
-        # -----------------------------------------------------
-        # WebSocket signaling loop
-        # -----------------------------------------------------
+    # ---------------------------------------------------------
+    # RECEIVE SIGNALING MESSAGES
+    # ---------------------------------------------------------
+
+    try:
+
         while True:
 
-            message = await websocket.receive_json()
+            message = (
+                await websocket.receive_json()
+            )
 
-            message_type = message.get("type")
+            message_type = message.get(
+                "type"
+            )
 
             if message_type not in {
                 "offer",
                 "answer",
                 "ice"
             }:
+
                 continue
 
-            # Forward signaling message to the other peer
-            for peer in list(session["connections"]):
+            # -------------------------------------------------
+            # Determine the other participant
+            # -------------------------------------------------
 
-                if peer is websocket:
-                    continue
+            if role == "host":
+
+                peer = session.get("phone")
+
+            else:
+
+                peer = session.get("host")
+
+            # -------------------------------------------------
+            # Forward message
+            # -------------------------------------------------
+
+            if peer is not None:
 
                 try:
-                    await peer.send_json(message)
+
+                    await peer.send_json(
+                        message
+                    )
 
                 except Exception as error:
+
                     print(
-                        "SIGNALING SEND ERROR:",
-                        error
+                        "LIVE SIGNALING FORWARD ERROR:",
+                        str(error)
                     )
+
+    except WebSocketDisconnect as error:
+
+        print(
+            f"LIVE SIGNALING DISCONNECTED: "
+            f"role={role}, "
+            f"session={session_id}, "
+            f"code={getattr(error, 'code', None)}"
+        )
 
     except Exception as error:
 
         print(
-            "LIVE SIGNALING CLOSED:",
-            str(error)
+            f"LIVE SIGNALING ERROR: "
+            f"role={role}, "
+            f"session={session_id}, "
+            f"error={str(error)}"
         )
 
     finally:
 
-        session["connections"].discard(websocket)
+        # -----------------------------------------------------
+        # ONLY REMOVE THIS SOCKET
+        # -----------------------------------------------------
+
+        if session.get(role) is websocket:
+
+            session[role] = None
 
         print(
             f"LIVE {role.upper()} DISCONNECTED: "
             f"{session_id}"
         )
 
-        # Tell remaining peer that the other side left
-        for peer in list(session["connections"]):
+        # -----------------------------------------------------
+        # Tell the other participant
+        # -----------------------------------------------------
+
+        other_role = (
+            "phone"
+            if role == "host"
+            else "host"
+        )
+
+        peer = session.get(
+            other_role
+        )
+
+        if peer is not None:
 
             try:
+
                 await peer.send_json({
                     "type": "peer_left"
                 })
@@ -910,7 +1036,7 @@ async def live_signaling(websocket: WebSocket, session_id: str):
             except Exception:
                 pass
 
-            
+                     
 @app.post("/api/digitize")
 async def digitize(
 

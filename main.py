@@ -615,10 +615,7 @@ def test():
     return {
 
         "status":
-            "success",
-
-        "message":
-            "InkSense API is working!"
+            "ok",
 
     }
 
